@@ -9,17 +9,26 @@ import re
 # ==========================================
 st.set_page_config(layout="wide", page_title="Display MPE MCO智能比較系統")
 
-# [修改 1] 注入 CSS 以縮小側邊欄按鈕
+# [修改] CSS 樣式表：
+# 1. 縮小側邊欄按鈕字體 (原本需求)
+# 2. 強制讓按鈕填滿寬度 (取代 use_container_width=True)
+# 3. 確保圖片在欄位中自適應
 st.markdown("""
 <style>
-    /* 針對側邊欄的一般按鈕 (上一個/下一個) 進行縮小 */
+    /* 側邊欄按鈕樣式優化 */
     div[data-testid="stSidebar"] div.stButton > button {
+        width: 100%;                     /* 強制填滿寬度 */
         font-size: 12px !important;      /* 字體縮小 */
         padding-top: 4px !important;     /* 減少上方留白 */
         padding-bottom: 4px !important;  /* 減少下方留白 */
         min-height: 0px !important;      /* 移除最小高度限制 */
         height: auto !important;         /* 高度自動 */
         line-height: 1.2 !important;     /* 行高緊湊 */
+    }
+    
+    /* 確保圖片填滿容器 */
+    div[data-testid="stImage"] > img {
+        width: 100%;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -258,9 +267,8 @@ if d1 or d2:
         st.divider()
         st.header("2. 標記列表")
         
-        # [修改 2 & 3] 調整順序，SPC 在前 (index 0) 成為預設值
+        # 預設 SPC
         cat_mode = st.radio("類別", ["SPC (字母)", "FAI (數字)"], horizontal=True)
-        # 根據選擇更新 Target Key
         target_key = "SPC" if "SPC" in cat_mode else "FAI"
         
         keys_1 = set(d1[target_key].keys()) if d1 else set()
@@ -272,7 +280,6 @@ if d1 or d2:
         else:
             all_keys.sort(key=lambda x: (len(x.split('-')[1]), x.split('-')[1]))
         
-        # --- 準備選項與差異索引 ---
         options = []
         diff_indices = []
         
@@ -304,7 +311,6 @@ if d1 or d2:
                 
             options.append(f"{icon}{k}")
 
-        # --- 導航回調 ---
         def go_prev_diff():
             current_opt = st.session_state.get('nav_radio')
             if current_opt in options:
@@ -321,17 +327,16 @@ if d1 or d2:
                 target_idx = next_candidates[0] if next_candidates else (diff_indices[0] if diff_indices else curr_idx)
                 st.session_state['nav_radio'] = options[target_idx]
 
-        # --- 導航按鈕 ---
         if d1 and d2 and diff_indices:
             col_b1, col_b2 = st.columns(2)
+            # [修改] 移除 use_container_width 以消除警告，依賴 CSS 進行寬度填充
             with col_b1:
-                st.button("⬆️ 上一個差異", on_click=go_prev_diff, use_container_width=True)
+                st.button("⬆️ 上一個差異", on_click=go_prev_diff)
             with col_b2:
-                st.button("⬇️ 下一個差異", on_click=go_next_diff, use_container_width=True)
+                st.button("⬇️ 下一個差異", on_click=go_next_diff)
             
             st.caption(f"發現 {len(diff_indices)} 個差異點。")
 
-        # --- 列表 ---
         if not options:
             st.warning("無此類別資料")
             sel_key = None
@@ -370,9 +375,11 @@ if d1 or d2:
                         dpi_scale=3.0, 
                         margin=view_scope
                     )
-                    st.image(img_hi, use_container_width=True)
+                    # [修改] 移除 use_container_width
+                    st.image(img_hi)
+                    
                     img_map = render_map_fast(st.session_state['bytes_1'], item['page'], item['rect'])
-                    st.image(img_map, use_container_width=True)
+                    st.image(img_map)
                 else:
                     st.warning("無此標記")
         
@@ -409,12 +416,12 @@ if d1 or d2:
                             draw_cross=False
                         )
                         _, diff_overlay = compare_images_cv2(img1_for_diff, img_hi)
-                        st.image(diff_overlay, caption="⚠️ 差異標示", use_container_width=True)
+                        st.image(diff_overlay, caption="⚠️ 差異標示")
                     else:
-                        st.image(img_hi, use_container_width=True)
+                        st.image(img_hi)
                     
                     img_map = render_map_fast(st.session_state['bytes_2'], item['page'], item['rect'])
-                    st.image(img_map, use_container_width=True)
+                    st.image(img_map)
                 else:
                     st.warning("無此標記")
 else:
