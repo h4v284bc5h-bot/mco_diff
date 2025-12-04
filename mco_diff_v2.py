@@ -4,87 +4,149 @@ import cv2
 import numpy as np
 import re
 
-# 設定頁面佈局
-st.set_page_config(layout="wide", page_title="SPC/FAI 智能自動差異檢測")
+# ==========================================
+# 0. 初始化與設定
+# ==========================================
+st.set_page_config(layout="wide", page_title="Display MPE MCO智能比較系統")
+
+# [修改 1] 注入 CSS 以縮小側邊欄按鈕
+st.markdown("""
+<style>
+    /* 針對側邊欄的一般按鈕 (上一個/下一個) 進行縮小 */
+    div[data-testid="stSidebar"] div.stButton > button {
+        font-size: 12px !important;      /* 字體縮小 */
+        padding-top: 4px !important;     /* 減少上方留白 */
+        padding-bottom: 4px !important;  /* 減少下方留白 */
+        min-height: 0px !important;      /* 移除最小高度限制 */
+        height: auto !important;         /* 高度自動 */
+        line-height: 1.2 !important;     /* 行高緊湊 */
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# 初始化 Session State
+if 'data_1' not in st.session_state: st.session_state['data_1'] = None
+if 'data_2' not in st.session_state: st.session_state['data_2'] = None
+if 'bytes_1' not in st.session_state: st.session_state['bytes_1'] = None
+if 'bytes_2' not in st.session_state: st.session_state['bytes_2'] = None
+if 'name_1' not in st.session_state: st.session_state['name_1'] = None
+if 'name_2' not in st.session_state: st.session_state['name_2'] = None
+if 'diff_results' not in st.session_state: st.session_state['diff_results'] = {}
+
+def reset_diff_state():
+    st.session_state['diff_results'] = {}
 
 # ==========================================
-# 1. 影像處理與差異檢測 (新增核心)
+# 1. 頂部佈局 (標題 + 視野拉桿)
 # ==========================================
+
+c_header, c_slider = st.columns([7, 3], vertical_alignment="bottom")
+
+with c_header:
+    st.title("🛡️ Display MPE MCO智能比較系統")
+
+with c_slider:
+    view_scope = st.slider(
+        "視野範圍 (Field of View)", 
+        min_value=50, max_value=300, 
+        value=120, step=10, 
+        help="數值越小=特寫越近，數值越大=看到越多周圍環境",
+        on_change=reset_diff_state
+    )
+
+# ==========================================
+# 2. 影像處理與差異檢測
+# ==========================================
+
+def pixmap_to_cv2(pix):
+    if pix.colorspace.n != 3:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n).copy()
+    return img_array
+
+@st.cache_data(show_spinner=False)
+def get_cached_base_map(file_bytes, page_num, zoom=2.0):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    page = doc[page_num]
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
+    return pixmap_to_cv2(pix)
+
+def render_map_fast(file_bytes, page_num, rect, zoom_map=2.0):
+    base_img = get_cached_base_map(file_bytes, page_num, zoom_map)
+    img = base_img.copy()
+    x = int((rect.x0 + rect.x1)/2 * zoom_map)
+    y = int((rect.y0 + rect.y1)/2 * zoom_map)
+    h, w = img.shape[:2]
+    cv2.line(img, (0, y), (w, y), (255, 0, 0), 2)
+    cv2.line(img, (x, 0), (x, h), (255, 0, 0), 2)
+    cv2.circle(img, (x, y), 50, (255, 0, 0), 4)
+    return img
+
+def render_smart_crop_fast(page, rect, dpi_scale=3.0, margin=120, draw_cross=True):
+    mat = fitz.Matrix(dpi_scale, dpi_scale)
+    clip_request = fitz.Rect(rect.x0 - margin, rect.y0 - margin, rect.x1 + margin, rect.y1 + margin)
+    final_clip = clip_request & page.rect
+    pix = page.get_pixmap(matrix=mat, clip=final_clip)
+    img = pixmap_to_cv2(pix)
+    
+    if draw_cross:
+        h, w = img.shape[:2]
+        center_x = (rect.x0 + rect.x1) / 2
+        center_y = (rect.y0 + rect.y1) / 2
+        rel_cx = (center_x - final_clip.x0) * dpi_scale
+        rel_cy = (center_y - final_clip.y0) * dpi_scale
+        cx, cy = int(rel_cx), int(rel_cy)
+        r = int((rect.width/2) * dpi_scale)
+        color = (255, 0, 0)
+        thickness = max(2, int(dpi_scale * 0.8))
+        try:
+            cv2.line(img, (0, cy), (w, cy), color, 1)
+            cv2.line(img, (cx, 0), (cx, h), color, 1)
+            cv2.circle(img, (cx, cy), r, color, thickness)
+        except: pass
+    return img
 
 def compare_images_cv2(img1, img2):
-    """
-    比較兩張圖片，回傳是否不同，以及標示差異後的圖片
-    """
-    # 1. 確保尺寸一致 (以 img1 為基準)
     h1, w1 = img1.shape[:2]
     img2_resized = cv2.resize(img2, (w1, h1))
-    
-    # 2. 轉灰階與高斯模糊 (去除雜訊與抗鋸齒誤差)
     gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
     gray2 = cv2.cvtColor(img2_resized, cv2.COLOR_RGB2GRAY)
-    
     gray1 = cv2.GaussianBlur(gray1, (5, 5), 0)
     gray2 = cv2.GaussianBlur(gray2, (5, 5), 0)
-    
-    # 3. 計算絕對差異
     diff = cv2.absdiff(gray1, gray2)
-    
-    # 4. 二值化差異圖 (設定門檻值，濾掉微小誤差)
     _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-    
-    # 5. 尋找差異輪廓
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     has_diff = False
-    result_img = img2_resized.copy() # 在新圖上標記
-    
+    result_img = img2_resized.copy()
     for cnt in contours:
-        # 忽略太小的噪點面積
         if cv2.contourArea(cnt) > 20:
             has_diff = True
             x, y, w, h = cv2.boundingRect(cnt)
-            # 畫出黃色框框標示差異
             cv2.rectangle(result_img, (x, y), (x + w, y + h), (255, 255, 0), 2)
-    
     return has_diff, result_img
 
-def run_batch_comparison(doc1, data1, doc2, data2):
-    """
-    輪詢所有共同的 Key，進行影像比對
-    """
-    diff_results = {} # 儲存比對結果 {key: True/False}
-    
-    # 取得共同 Keys
+def run_batch_comparison(doc1, data1, doc2, data2, margin_val):
+    diff_results = {}
     keys1 = set(data1["FAI"].keys()) | set(data1["SPC"].keys())
     keys2 = set(data2["FAI"].keys()) | set(data2["SPC"].keys())
     common_keys = list(keys1 & keys2)
-    
     progress_bar = st.progress(0)
-    
     for i, key in enumerate(common_keys):
-        # 判斷類別
         cat = "FAI" if "FAI" in key else "SPC"
-        
         item1 = data1[cat][key]
         item2 = data2[cat][key]
-        
-        # 渲染局部圖 (使用較低解析度 2.0x 進行快速比對)
-        # 注意：這裡 margin 設小一點，只比對泡泡本體與緊鄰文字
-        img1 = render_smart_crop(doc1[item1['page']], item1['rect'], dpi_scale=2.0, margin=10, draw_cross=False)
-        img2 = render_smart_crop(doc2[item2['page']], item2['rect'], dpi_scale=2.0, margin=10, draw_cross=False)
-        
+        img1 = render_smart_crop_fast(doc1[item1['page']], item1['rect'], dpi_scale=2.0, margin=margin_val, draw_cross=False)
+        img2 = render_smart_crop_fast(doc2[item2['page']], item2['rect'], dpi_scale=2.0, margin=margin_val, draw_cross=False)
         is_diff, _ = compare_images_cv2(img1, img2)
-        
         if is_diff:
             diff_results[key] = True
-            
         progress_bar.progress((i + 1) / len(common_keys))
-        
     progress_bar.empty()
     return diff_results
 
 # ==========================================
-# 2. 核心解析引擎 (維持向量邏輯)
+# 3. 核心解析引擎
 # ==========================================
 
 def get_text_spans(page):
@@ -110,109 +172,44 @@ def is_vector_circle(path):
 def analyze_bubbles(doc):
     fai_dict = {}
     spc_dict = {}
-    
     for page_num, page in enumerate(doc):
         text_spans = get_text_spans(page)
         paths = page.get_drawings()
-        
         for path in paths:
             if not is_vector_circle(path): continue
             rect = path["rect"]
             cx, cy = (rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2
-            
             top_texts = [s["text"] for s in text_spans if rect.contains(s["center"]) and s["center"][1] < cy]
             bot_texts = [s["text"] for s in text_spans if rect.contains(s["center"]) and s["center"][1] > cy]
-            
             top_str = "".join(top_texts).upper()
             bot_str = "".join(bot_texts).strip()
             bot_str_clean = re.sub(r'[-_]', '', bot_str)
-            
             item = {"page": page_num, "rect": rect}
-            
             if "FAI" in top_str:
                 num_match = re.search(r'\d+', bot_str_clean)
                 if num_match:
-                    label = f"FAI-{num_match.group()}"
-                    item["label"] = label
+                    item["label"] = f"FAI-{num_match.group()}"
                     item["sort_val"] = int(num_match.group())
-                    fai_dict[label] = item
+                    fai_dict[item["label"]] = item
             elif "SPC" in top_str:
                 alpha_match = re.search(r'[A-Z]+', bot_str_clean.upper())
                 if alpha_match:
-                    label = f"SPC-{alpha_match.group()}"
-                    item["label"] = label
+                    item["label"] = f"SPC-{alpha_match.group()}"
                     item["sort_val"] = alpha_match.group()
-                    spc_dict[label] = item
-
+                    spc_dict[item["label"]] = item
     return fai_dict, spc_dict
 
 # ==========================================
-# 3. 視覺化工具
+# 4. Streamlit UI (側邊欄)
 # ==========================================
 
-def render_smart_crop(page, rect, dpi_scale=4.0, margin=80, draw_cross=True):
-    mat = fitz.Matrix(dpi_scale, dpi_scale)
-    clip = fitz.Rect(rect.x0 - margin, rect.y0 - margin, rect.x1 + margin, rect.y1 + margin)
-    pix = page.get_pixmap(matrix=mat, clip=clip)
-    img = cv2.imdecode(np.frombuffer(pix.tobytes(), np.uint8), cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    if draw_cross:
-        h, w = img.shape[:2]
-        rel_cx = (rect.x0 - clip.x0 + rect.width/2) * dpi_scale
-        rel_cy = (rect.y0 - clip.y0 + rect.height/2) * dpi_scale
-        cx, cy = int(rel_cx), int(rel_cy)
-        r = int((rect.width/2) * dpi_scale)
-        
-        color = (255, 0, 0)
-        thickness = 3 
-        
-        cv2.line(img, (0, cy), (w, cy), color, 1)
-        cv2.line(img, (cx, 0), (cx, h), color, 1)
-        cv2.circle(img, (cx, cy), r, color, thickness)
-    
-    return img
-
-def render_map(page, rect):
-    zoom_map = 2.0
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom_map, zoom_map))
-    img = cv2.imdecode(np.frombuffer(pix.tobytes(), np.uint8), cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    x = int((rect.x0 + rect.x1)/2 * zoom_map)
-    y = int((rect.y0 + rect.y1)/2 * zoom_map)
-    h, w = img.shape[:2]
-    
-    line_thickness = 4 
-    circle_radius = 50 
-    
-    cv2.line(img, (0, y), (w, y), (255, 0, 0), 2)
-    cv2.line(img, (x, 0), (x, h), (255, 0, 0), 2)
-    cv2.circle(img, (x, y), circle_radius, (255, 0, 0), line_thickness)
-    
-    return img
-
-# ==========================================
-# 4. Streamlit UI
-# ==========================================
-
-st.title("🛡️ SPC/FAI 智能自動差異檢測")
-
-# Session Init
-if 'data_1' not in st.session_state: st.session_state['data_1'] = None
-if 'data_2' not in st.session_state: st.session_state['data_2'] = None
-if 'bytes_1' not in st.session_state: st.session_state['bytes_1'] = None
-if 'bytes_2' not in st.session_state: st.session_state['bytes_2'] = None
-if 'diff_results' not in st.session_state: st.session_state['diff_results'] = {}
-
-# --- 側邊欄：檔案上傳 ---
 with st.sidebar:
     st.header("1. 檔案載入")
     f1 = st.file_uploader("檔案 1 (基準)", type="pdf", key="f1")
     f2 = st.file_uploader("檔案 2 (對照)", type="pdf", key="f2")
 
-    # 處理檔案 1
     if f1:
+        st.session_state['name_1'] = f1.name
         curr_bytes = f1.getvalue()
         if st.session_state['bytes_1'] != curr_bytes:
             st.session_state['bytes_1'] = curr_bytes
@@ -220,11 +217,15 @@ with st.sidebar:
                 doc = fitz.open(stream=curr_bytes, filetype="pdf")
                 f_d, s_d = analyze_bubbles(doc)
                 st.session_state['data_1'] = {"FAI": f_d, "SPC": s_d}
-                # Reset diff results
                 st.session_state['diff_results'] = {}
+    else:
+        st.session_state['data_1'] = None
+        st.session_state['bytes_1'] = None
+        st.session_state['name_1'] = None
+        st.session_state['diff_results'] = {}
 
-    # 處理檔案 2
     if f2:
+        st.session_state['name_2'] = f2.name
         curr_bytes = f2.getvalue()
         if st.session_state['bytes_2'] != curr_bytes:
             st.session_state['bytes_2'] = curr_bytes
@@ -232,142 +233,189 @@ with st.sidebar:
                 doc = fitz.open(stream=curr_bytes, filetype="pdf")
                 f_d, s_d = analyze_bubbles(doc)
                 st.session_state['data_2'] = {"FAI": f_d, "SPC": s_d}
-                # Reset diff results
                 st.session_state['diff_results'] = {}
     else:
-        st.session_state['bytes_2'] = None
         st.session_state['data_2'] = None
+        st.session_state['bytes_2'] = None
+        st.session_state['name_2'] = None
         st.session_state['diff_results'] = {}
 
-# --- 自動比對邏輯 (Trigger) ---
 d1 = st.session_state['data_1']
 d2 = st.session_state['data_2']
 diff_res = st.session_state['diff_results']
 
-# 當兩個檔案都準備好，且尚未進行比對時，觸發比對
+# 自動觸發比對
 if d1 and d2 and not diff_res:
-    with st.spinner("🔄 正在輪詢並比對所有標記差異..."):
+    with st.spinner("🔄 正在比對所有標記差異..."):
         doc1 = fitz.open(stream=st.session_state['bytes_1'], filetype="pdf")
         doc2 = fitz.open(stream=st.session_state['bytes_2'], filetype="pdf")
-        
-        # 執行批次比對
-        results = run_batch_comparison(doc1, d1, doc2, d2)
+        results = run_batch_comparison(doc1, d1, doc2, d2, margin_val=view_scope)
         st.session_state['diff_results'] = results
         st.success(f"比對完成！發現 {len(results)} 處變更。")
 
-# --- UI 顯示邏輯 ---
-if d1:
+if d1 or d2:
     with st.sidebar:
         st.divider()
         st.header("2. 標記列表")
         
-        cat_mode = st.radio("類別", ["FAI (數字)", "SPC (字母)"], horizontal=True)
-        target_key = "FAI" if "FAI" in cat_mode else "SPC"
+        # [修改 2 & 3] 調整順序，SPC 在前 (index 0) 成為預設值
+        cat_mode = st.radio("類別", ["SPC (字母)", "FAI (數字)"], horizontal=True)
+        # 根據選擇更新 Target Key
+        target_key = "SPC" if "SPC" in cat_mode else "FAI"
         
         keys_1 = set(d1[target_key].keys()) if d1 else set()
         keys_2 = set(d2[target_key].keys()) if d2 else set()
         all_keys = list(keys_1 | keys_2)
         
-        # 排序
         if target_key == "FAI":
             all_keys.sort(key=lambda x: int(x.split('-')[1]))
         else:
             all_keys.sort(key=lambda x: (len(x.split('-')[1]), x.split('-')[1]))
         
+        # --- 準備選項與差異索引 ---
         options = []
-        for k in all_keys:
+        diff_indices = []
+        
+        for idx, k in enumerate(all_keys):
             icon = ""
-            if d2: 
+            is_diff = False
+            
+            if d1 and d2:
                 in_1 = k in keys_1
                 in_2 = k in keys_2
                 
                 if in_1 and in_2:
-                    # 檢查是否有內容差異
                     if k in st.session_state['diff_results']:
-                        icon = "⚠️ " # 差異!
+                        icon = "⚠️ "
+                        is_diff = True
                     else:
-                        icon = "✅ " # 無差異
-                elif in_1 and not in_2: icon = "❌ "
-                elif not in_1 and in_2: icon = "🆕 "
+                        icon = "✅ "
+                elif in_1 and not in_2:
+                    icon = "❌ "
+                    is_diff = True
+                elif not in_1 and in_2:
+                    icon = "🆕 "
+                    is_diff = True
             else:
                 icon = "📍 "
             
+            if is_diff:
+                diff_indices.append(idx)
+                
             options.append(f"{icon}{k}")
+
+        # --- 導航回調 ---
+        def go_prev_diff():
+            current_opt = st.session_state.get('nav_radio')
+            if current_opt in options:
+                curr_idx = options.index(current_opt)
+                prev_candidates = [i for i in diff_indices if i < curr_idx]
+                target_idx = prev_candidates[-1] if prev_candidates else (diff_indices[-1] if diff_indices else curr_idx)
+                st.session_state['nav_radio'] = options[target_idx]
+
+        def go_next_diff():
+            current_opt = st.session_state.get('nav_radio')
+            if current_opt in options:
+                curr_idx = options.index(current_opt)
+                next_candidates = [i for i in diff_indices if i > curr_idx]
+                target_idx = next_candidates[0] if next_candidates else (diff_indices[0] if diff_indices else curr_idx)
+                st.session_state['nav_radio'] = options[target_idx]
+
+        # --- 導航按鈕 ---
+        if d1 and d2 and diff_indices:
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                st.button("⬆️ 上一個差異", on_click=go_prev_diff, use_container_width=True)
+            with col_b2:
+                st.button("⬇️ 下一個差異", on_click=go_next_diff, use_container_width=True)
             
+            st.caption(f"發現 {len(diff_indices)} 個差異點。")
+
+        # --- 列表 ---
         if not options:
             st.warning("無此類別資料")
             sel_key = None
         else:
-            sel_opt = st.radio("選擇標記:", options, label_visibility="collapsed")
+            sel_opt = st.radio("選擇標記:", options, label_visibility="collapsed", key="nav_radio")
             sel_key = sel_opt.split(" ")[1] if " " in sel_opt else sel_opt
 
     # --- 主畫面 ---
     if sel_key:
-        # 判斷是否為「差異」項目
         is_modified = sel_key in st.session_state['diff_results']
-        status_text = " (⚠️ 偵測到變更)" if is_modified else ""
+        status_text = " (⚠️ 變更)" if is_modified else ""
         
-        st.subheader(f"{sel_opt} 同步檢視 {status_text}")
+        st.subheader(f"{sel_opt} 檢視 {status_text}")
         
-        view_scope = st.slider(
-            "視野範圍 (Field of View)", 
-            min_value=50, max_value=300, 
-            value=100, step=10
-        )
-        
-        c1, c2 = st.columns(2)
+        if d1 and d2:
+            c1, c2 = st.columns(2)
+        elif d1:
+            _, c1, _ = st.columns([1, 2, 1])
+            c2 = None
+        elif d2:
+            _, c2, _ = st.columns([1, 2, 1])
+            c1 = None
         
         # --- File 1 Render ---
-        with c1:
-            st.markdown("### 📄 檔案 1")
-            if d1 and sel_key in d1[target_key]:
-                item = d1[target_key][sel_key]
-                doc1 = fitz.open(stream=st.session_state['bytes_1'], filetype="pdf")
-                page1 = doc1[item['page']]
+        if c1 and d1:
+            with c1:
+                name1 = st.session_state['name_1']
+                role1 = "(基準)" if d2 else ""
+                st.markdown(f"<h4 style='text-align:center;'>📄 {name1}<br><span style='font-size:0.7em; color:gray;'>{role1}</span></h4>", unsafe_allow_html=True)
                 
-                sub_c1, sub_c2, sub_c3 = st.columns([1.5, 7, 1.5])
-                with sub_c2:
-                    img_hi = render_smart_crop(page1, item['rect'], dpi_scale=4.0, margin=view_scope)
+                if sel_key in d1[target_key]:
+                    item = d1[target_key][sel_key]
+                    img_hi = render_smart_crop_fast(
+                        fitz.open(stream=st.session_state['bytes_1'], filetype="pdf")[item['page']], 
+                        item['rect'], 
+                        dpi_scale=3.0, 
+                        margin=view_scope
+                    )
                     st.image(img_hi, use_container_width=True)
-                
-                img_map = render_map(page1, item['rect'])
-                st.image(img_map, use_container_width=True)
-            else:
-                st.warning("無此標記")
-                
+                    img_map = render_map_fast(st.session_state['bytes_1'], item['page'], item['rect'])
+                    st.image(img_map, use_container_width=True)
+                else:
+                    st.warning("無此標記")
+        
         # --- File 2 Render ---
-        with c2:
-            st.markdown("### 📄 檔案 2")
-            if d2 and sel_key in d2[target_key]:
-                item = d2[target_key][sel_key]
-                doc2 = fitz.open(stream=st.session_state['bytes_2'], filetype="pdf")
-                page2 = doc2[item['page']]
+        if c2 and d2:
+            with c2:
+                name2 = st.session_state['name_2']
+                role2 = "(對照)" if d1 else ""
+                st.markdown(f"<h4 style='text-align:center;'>📄 {name2}<br><span style='font-size:0.7em; color:gray;'>{role2}</span></h4>", unsafe_allow_html=True)
                 
-                sub_c1, sub_c2, sub_c3 = st.columns([1.5, 7, 1.5])
-                with sub_c2:
-                    # 渲染基礎圖
-                    img_hi = render_smart_crop(page2, item['rect'], dpi_scale=4.0, margin=view_scope)
+                if sel_key in d2[target_key]:
+                    item = d2[target_key][sel_key]
+                    img_hi = render_smart_crop_fast(
+                        fitz.open(stream=st.session_state['bytes_2'], filetype="pdf")[item['page']],
+                        item['rect'], 
+                        dpi_scale=3.0, 
+                        margin=view_scope
+                    )
                     
-                    # [關鍵功能 3] 如果有差異，在 Local Zoom 畫面上畫出差異框
-                    if is_modified and d1 and sel_key in d1[target_key]:
-                        # 為了畫出差異，我們需要再拿 File 1 的圖來比對一次 (這次是用目前的高解析度設定)
+                    if d1 and is_modified and sel_key in d1[target_key]:
                         item1 = d1[target_key][sel_key]
-                        page1 = doc1[item1['page']]
-                        img1_for_diff = render_smart_crop(page1, item1['rect'], dpi_scale=4.0, margin=view_scope, draw_cross=False)
-                        
-                        # 產生沒有十字線的 File 2 圖來做乾淨比對
-                        img2_clean = render_smart_crop(page2, item['rect'], dpi_scale=4.0, margin=view_scope, draw_cross=False)
-                        
-                        # 計算差異並畫在 img_hi (有十字線的圖) 上
-                        # 我們呼叫 compare_images_cv2，但我們要把它畫在 img_hi 上
-                        _, diff_overlay = compare_images_cv2(img1_for_diff, img_hi) # 注意: 這裡傳入 img_hi 讓框框畫在有十字的圖上
-                        st.image(diff_overlay, caption="⚠️ 差異標示 (黃框)", use_container_width=True)
+                        img1_for_diff = render_smart_crop_fast(
+                            fitz.open(stream=st.session_state['bytes_1'], filetype="pdf")[item1['page']],
+                            item1['rect'], 
+                            dpi_scale=3.0, 
+                            margin=view_scope, 
+                            draw_cross=False
+                        )
+                        img2_clean = render_smart_crop_fast(
+                            fitz.open(stream=st.session_state['bytes_2'], filetype="pdf")[item['page']],
+                            item['rect'], 
+                            dpi_scale=3.0, 
+                            margin=view_scope, 
+                            draw_cross=False
+                        )
+                        _, diff_overlay = compare_images_cv2(img1_for_diff, img_hi)
+                        st.image(diff_overlay, caption="⚠️ 差異標示", use_container_width=True)
                     else:
                         st.image(img_hi, use_container_width=True)
                     
-                img_map = render_map(page2, item['rect'])
-                st.image(img_map, use_container_width=True)
-            else:
-                st.warning("無此標記")
+                    img_map = render_map_fast(st.session_state['bytes_2'], item['page'], item['rect'])
+                    st.image(img_map, use_container_width=True)
+                else:
+                    st.warning("無此標記")
 else:
-    st.info("請先上傳檔案 1。")
+    st.info("請上傳至少一個 PDF 檔案以開始。")
