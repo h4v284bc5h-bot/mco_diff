@@ -1,6 +1,5 @@
-opencv-python-headless
 streamlit
-pandas
 numpy
+pandas
 pymupdf
-re
+opencv-python-headless
