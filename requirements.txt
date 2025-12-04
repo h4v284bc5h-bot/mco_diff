@@ -1,6 +1,6 @@
+opencv-python
 streamlit
 pandas
 numpy
 pymupdf
-opencv-python
 re
